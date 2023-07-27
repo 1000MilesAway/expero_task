@@ -6,6 +6,7 @@ require (
 	github.com/georgysavva/scany v1.2.1
 	github.com/gin-gonic/gin v1.9.1
 	github.com/jackc/pgx/v4 v4.18.1
+	github.com/lib/pq v1.10.2
 	github.com/sirupsen/logrus v1.9.3
 )
 

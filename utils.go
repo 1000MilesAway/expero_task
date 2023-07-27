@@ -1,37 +1,16 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"errors"
 	"net/http"
-	"strings"
 
-	"github.com/georgysavva/scany/pgxscan"
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
 )
 
 var MaxPacks = 500
-
-type AggregationJson struct {
-	SSCC    string   `json:"sscc"`
-	Created string   `json:"created"`
-	SGTINs  []string `json:"sgtins"`
-}
-
-type DeAggregationJson struct {
-	SGTINs []string `json:"sgtins"`
-}
-
-type DeAggregationRespJson struct {
-	SSCC string `json:"sscc"`
-}
-
-type Resp struct {
-	Ok        bool   `json:"ok"`
-	Error     string `json:"error"`
-	ErrorCode uint   `json:"error_code"`
-}
+var errValid = errors.New("Validation error")
 
 func Aggregation(c *gin.Context) {
 	var aggr AggregationJson
@@ -42,32 +21,23 @@ func Aggregation(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "Invalid json data"})
 		return
 	}
-	// logrus.Info(aggr)
 
-	if len(aggr.SGTINs) > MaxPacks {
-		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "Колличество пачек превышает максимум", "error_code": 1})
+	resp, err := aggr.validate()
+	if err != nil {
+		logrus.Error(err)
+		c.JSON(http.StatusBadRequest, resp)
 		return
 	}
 
-	gtin := aggr.SGTINs[0][:14]
-	for i := 1; i < len(aggr.SGTINs); i++ {
-		if aggr.SGTINs[i][:14] != gtin {
-			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "GTIN отличается", "error_code": 1})
+	_, err = GetDB().Query("INSERT INTO packages VALUES ($1, $2, $3)", aggr.SSCC, aggr.Created, pq.Array(aggr.SGTINs))
+
+	if sqlError, ok := err.(*pq.Error); ok {
+		if sqlError.Code == "23505" {
+			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "SSCC уже использован", "error_code": 1})
 			return
 		}
-	}
-
-	ctx := context.Background()
-
-	var dst []interface{}
-	err = pgxscan.Select(ctx, GetDB(), &dst, fmt.Sprintf(
-		`INSERT INTO packages
-		VALUES ('%s', '%s', '{%s}')`, aggr.SSCC, aggr.Created, strings.Join(aggr.SGTINs, ",")))
-
-	if err.Error() == "scanning all: scany: rows final error: ERROR: duplicate key value violates unique constraint \"packages_pkey\" (SQLSTATE 23505)" {
-		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "SSCC уже использован", "error_code": 1})
-		return
 	} else if err != nil {
+		logrus.Error(err)
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": err.Error(), "error_code": 1})
 		return
 	}
@@ -85,22 +55,31 @@ func DeAggregation(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "Invalid json data"})
 		return
 	}
-	logrus.Info(aggr)
-
-	ctx := context.Background()
+	resp, err := aggr.validate()
+	if err != nil {
+		logrus.Error(err)
+		c.JSON(http.StatusBadRequest, resp)
+		return
+	}
 
 	result := make(map[string]string)
 	for _, sgtin := range aggr.SGTINs {
-		var dst []DeAggregationRespJson
-		if err := pgxscan.Select(ctx, GetDB(), &dst,
-			fmt.Sprintf(`SELECT sscc FROM packages
-			WHERE '%s' = ANY(sgtins)`, sgtin)); err != nil {
+		rows, err := GetDB().Query("SELECT sscc FROM packages WHERE $1 = ANY(sgtins)", sgtin)
+		defer rows.Close()
+
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"ok": false, "error": "SSCC уже использован", "error_code": 1})
 			return
 		}
-		logrus.Info(dst)
-		if len(dst) != 0 {
-			result[sgtin] = dst[0].SSCC
+
+		var ssccList []string
+		for rows.Next() {
+			var temp string
+			rows.Scan(&temp)
+			ssccList = append(ssccList, temp)
+		}
+		if len(ssccList) != 0 {
+			result[sgtin] = ssccList[0]
 		} else {
 			result[sgtin] = "null"
 		}
